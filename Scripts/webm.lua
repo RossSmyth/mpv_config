@@ -13,6 +13,8 @@ local options = {
 	-- backslashes as a path separator. Examples of valid inputs for this field
 	-- would be: [[]] (the default, empty value), [[C:\Users\John]] (on Windows),
 	-- and [[/home/john]] (on Unix-like systems eg. Linux).
+	-- The [[]] delimiter is not needed when using from a configuration file
+	-- in the script-opts folder.
 	output_directory = [[G:\My Drive\web shit\Clips\Videos]],
 	run_detached = false,
 	-- Template string for the output file
@@ -23,9 +25,14 @@ local options = {
 	-- %S, %E - Start and end time, without milliseconds
 	-- %M - "-audio", if audio is enabled, empty otherwise
 	-- %R - "-(height)p", where height is the video's height, or scale_height, if it's enabled.
+	-- More specifiers are supported, see https://mpv.io/manual/master/#options-screenshot-template
+	-- Property expansion is supported (with %{} at top level, ${} when nested), see https://mpv.io/manual/master/#property-expansion
 	output_template = "%F-[%s-%e]%M",
 	-- Scale video to a certain height, keeping the aspect ratio. -1 disables it.
 	scale_height = 720,
+	-- Change the FPS of the output video, dropping or duplicating frames as needed.
+	-- -1 means the FPS will be unchanged from the source.
+	fps = -1,
 	-- Target filesize, in kB. This will be used to calculate the bitrate
 	-- used on the encode. If this is set to <= 0, the video bitrate will be set
 	-- to 0, which might enable constant quality modes, depending on the
@@ -40,16 +47,22 @@ local options = {
 	-- In kilobits.
 	strict_audio_bitrate = 64,
 	-- Sets the output format, from a few predefined ones.
-	-- Currently we have webm-vp8 (libvpx/libvorbis), webm-vp9 (libvpx-vp9/libvorbis)
-	-- and raw (rawvideo/pcm_s16le).
+	-- Currently we have:
+	-- webm-vp8 (libvpx/libvorbis)
+	-- webm-vp9 (libvpx-vp9/libopus)
+	-- mp4 (h264/AAC)
+	-- mp4-nvenc (h264-NVENC/AAC)
+	-- raw (rawvideo/pcm_s16le).
+	-- mp3 (libmp3lame)
+	-- and gif
 	output_format = "webm-vp8",
-	twopass = false,
+	twopass = true,
 	-- If set, applies the video filters currently used on the playback to the encode.
 	apply_current_filters = true,
 	-- If set, writes the video's filename to the "Title" field on the metadata.
 	write_filename_on_metadata = false,
 	-- Set the number of encoding threads, for codecs libvpx and libvpx-vp9
-	libvpx_threads = 8,
+	libvpx_threads = 4,
 	additional_flags = "",
 	-- Constant Rate Factor (CRF). The value meaning and limits may change,
 	-- from codec to codec. Set to -1 to disable.
@@ -63,7 +76,12 @@ local options = {
 	-- The font size used in the menu. Isn't used for the notifications (started encode, finished encode etc)
 	font_size = 28,
 	margin = 10,
-	message_duration = 5
+	message_duration = 5,
+	-- gif dither mode, 0-5 for bayer w/ bayer_scale 0-5, 6 for paletteuse default (sierra2_4a)
+	gif_dither = 2,
+	-- Force square pixels on output video
+	-- Some players like recent Firefox versions display videos with non-square pixels with wrong aspect ratio
+	force_square_pixels = false,
 }
 
 mpopts.read_options(options)
@@ -98,6 +116,18 @@ function base64_decode(data)
         return string.char(c)
     end))
 end
+local emit_event
+emit_event = function(event_name, ...)
+  return mp.commandv("script-message", "webm-" .. tostring(event_name), ...)
+end
+local test_set_options
+test_set_options = function(new_options_json)
+  local new_options = utils.parse_json(new_options_json)
+  for k, v in pairs(new_options) do
+    options[k] = v
+  end
+end
+mp.register_script_message("mpv-webm-set-options", test_set_options)
 local bold
 bold = function(text)
   return "{\\b1}" .. tostring(text) .. "{\\b0}"
@@ -145,9 +175,84 @@ file_exists = function(name)
   end
   return false
 end
+local expand_properties
+expand_properties = function(text, magic)
+  if magic == nil then
+    magic = "$"
+  end
+  for prefix, raw, prop, colon, fallback, closing in text:gmatch("%" .. magic .. "{([?!]?)(=?)([^}:]*)(:?)([^}]*)(}*)}") do
+    local err
+    local prop_value
+    local compare_value
+    local original_prop = prop
+    local get_property = mp.get_property_osd
+    if raw == "=" then
+      get_property = mp.get_property
+    end
+    if prefix ~= "" then
+      for actual_prop, compare in prop:gmatch("(.-)==(.*)") do
+        prop = actual_prop
+        compare_value = compare
+      end
+    end
+    if colon == ":" then
+      prop_value, err = get_property(prop, fallback)
+    else
+      prop_value, err = get_property(prop, "(error)")
+    end
+    prop_value = tostring(prop_value)
+    if prefix == "?" then
+      if compare_value == nil then
+        prop_value = err == nil and fallback .. closing or ""
+      else
+        prop_value = prop_value == compare_value and fallback .. closing or ""
+      end
+      prefix = "%" .. prefix
+    elseif prefix == "!" then
+      if compare_value == nil then
+        prop_value = err ~= nil and fallback .. closing or ""
+      else
+        prop_value = prop_value ~= compare_value and fallback .. closing or ""
+      end
+    else
+      prop_value = prop_value .. closing
+    end
+    if colon == ":" then
+      local _
+      text, _ = text:gsub("%" .. magic .. "{" .. prefix .. raw .. original_prop:gsub("%W", "%%%1") .. ":" .. fallback:gsub("%W", "%%%1") .. closing .. "}", expand_properties(prop_value))
+    else
+      local _
+      text, _ = text:gsub("%" .. magic .. "{" .. prefix .. raw .. original_prop:gsub("%W", "%%%1") .. closing .. "}", prop_value)
+    end
+  end
+  return text
+end
 local format_filename
 format_filename = function(startTime, endTime, videoFormat)
+  local hasAudioCodec = videoFormat.audioCodec ~= ""
+  local replaceFirst = {
+    ["%%mp"] = "%%mH.%%mM.%%mS",
+    ["%%mP"] = "%%mH.%%mM.%%mS.%%mT",
+    ["%%p"] = "%%wH.%%wM.%%wS",
+    ["%%P"] = "%%wH.%%wM.%%wS.%%wT"
+  }
   local replaceTable = {
+    ["%%wH"] = string.format("%02d", math.floor(startTime / (60 * 60))),
+    ["%%wh"] = string.format("%d", math.floor(startTime / (60 * 60))),
+    ["%%wM"] = string.format("%02d", math.floor(startTime / 60 % 60)),
+    ["%%wm"] = string.format("%d", math.floor(startTime / 60)),
+    ["%%wS"] = string.format("%02d", math.floor(startTime % 60)),
+    ["%%ws"] = string.format("%d", math.floor(startTime)),
+    ["%%wf"] = string.format("%s", startTime),
+    ["%%wT"] = string.sub(string.format("%.3f", startTime % 1), 3),
+    ["%%mH"] = string.format("%02d", math.floor(endTime / (60 * 60))),
+    ["%%mh"] = string.format("%d", math.floor(endTime / (60 * 60))),
+    ["%%mM"] = string.format("%02d", math.floor(endTime / 60 % 60)),
+    ["%%mm"] = string.format("%d", math.floor(endTime / 60)),
+    ["%%mS"] = string.format("%02d", math.floor(endTime % 60)),
+    ["%%ms"] = string.format("%d", math.floor(endTime)),
+    ["%%mf"] = string.format("%s", endTime),
+    ["%%mT"] = string.sub(string.format("%.3f", endTime % 1), 3),
     ["%%f"] = mp.get_property("filename"),
     ["%%F"] = mp.get_property("filename/no-ext"),
     ["%%s"] = seconds_to_path_element(startTime),
@@ -155,13 +260,33 @@ format_filename = function(startTime, endTime, videoFormat)
     ["%%e"] = seconds_to_path_element(endTime),
     ["%%E"] = seconds_to_path_element(endTime, true),
     ["%%T"] = mp.get_property("media-title"),
-    ["%%M"] = (mp.get_property_native('aid') and not mp.get_property_native('mute')) and '-audio' or '',
-    ["%%R"] = (options.scale_height ~= -1) and "-" .. tostring(options.scale_height) .. "p" or "-" .. tostring(mp.get_property_native('height')) .. "p"
+    ["%%M"] = (mp.get_property_native('aid') and not mp.get_property_native('mute') and hasAudioCodec) and '-audio' or '',
+    ["%%R"] = (options.scale_height ~= -1) and "-" .. tostring(options.scale_height) .. "p" or "-" .. tostring(mp.get_property_native('height')) .. "p",
+    ["%%t%%"] = "%%"
   }
   local filename = options.output_template
+  for format, value in pairs(replaceFirst) do
+    local _
+    filename, _ = filename:gsub(format, value)
+  end
   for format, value in pairs(replaceTable) do
     local _
     filename, _ = filename:gsub(format, value)
+  end
+  if mp.get_property_bool("demuxer-via-network", false) then
+    local _
+    filename, _ = filename:gsub("%%X{([^}]*)}", "%1")
+    filename, _ = filename:gsub("%%x", "")
+  else
+    local x = string.gsub(mp.get_property("stream-open-filename", ""), string.gsub(mp.get_property("filename", ""), "%W", "%%%1") .. "$", "")
+    local _
+    filename, _ = filename:gsub("%%X{[^}]*}", x)
+    filename, _ = filename:gsub("%%x", x)
+  end
+  filename = expand_properties(filename, "%")
+  for format in filename:gmatch("%%t([aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ])") do
+    local _
+    filename, _ = filename:gsub("%%t" .. format, os.date("%" .. format))
   end
   local _
   filename, _ = filename:gsub("[<>:\"/\\|?*]", "")
@@ -202,10 +327,10 @@ end
 local run_subprocess
 run_subprocess = function(params)
   local res = utils.subprocess(params)
+  msg.verbose("Command stdout: ")
+  msg.verbose(res.stdout)
   if res.status ~= 0 then
     msg.verbose("Command failed! Reason: ", res.error, " Killed by us? ", res.killed_by_us and "yes" or "no")
-    msg.verbose("Command stdout: ")
-    msg.verbose(res.stdout)
     return false
   end
   return true
@@ -637,7 +762,7 @@ do
 end
 local read_logfile_into_stats_array
 read_logfile_into_stats_array = function(logfile_path)
-  local file = io.open(logfile_path, "rb")
+  local file = assert(io.open(logfile_path, "rb"))
   local logfile_string = base64_decode(file:read())
   file:close()
   local stats_size = FirstpassStats:size()
@@ -654,7 +779,7 @@ read_logfile_into_stats_array = function(logfile_path)
 end
 local write_stats_array_to_logfile
 write_stats_array_to_logfile = function(stats_array, logfile_path)
-  local file = io.open(logfile_path, "wb")
+  local file = assert(io.open(logfile_path, "wb"))
   local logfile_string = ""
   for _index_0 = 1, #stats_array do
     local stat = stats_array[_index_0]
@@ -686,6 +811,19 @@ do
     end,
     getFlags = function(self)
       return { }
+    end,
+    getCodecFlags = function(self)
+      local codecs = { }
+      if self.videoCodec ~= "" then
+        codecs[#codecs + 1] = "--ovc=" .. tostring(self.videoCodec)
+      end
+      if self.audioCodec ~= "" then
+        codecs[#codecs + 1] = "--oac=" .. tostring(self.audioCodec)
+      end
+      return codecs
+    end,
+    postCommandModifier = function(self, command, region, startTime, endTime)
+      return command
     end
   }
   _base_0.__index = _base_0
@@ -801,7 +939,11 @@ do
     end,
     getFlags = function(self)
       return {
-        "--ovcopts-add=threads=" .. tostring(options.libvpx_threads)
+        "--ovcopts-add=threads=" .. tostring(options.libvpx_threads),
+        "--ovcopts-add=auto-alt-ref=1",
+        "--ovcopts-add=lag-in-frames=25",
+        "--ovcopts-add=quality=good",
+        "--ovcopts-add=cpu-used=0"
       }
     end
   }
@@ -860,9 +1002,9 @@ do
   _class_0 = setmetatable({
     __init = function(self)
       self.displayName = "WebM (VP9)"
-      self.supportsTwopass = true
+      self.supportsTwopass = false
       self.videoCodec = "libvpx-vp9"
-      self.audioCodec = "libvorbis"
+      self.audioCodec = "libopus"
       self.outputExtension = "webm"
       self.acceptsBitrate = true
     end,
@@ -982,6 +1124,154 @@ do
   MP4NVENC = _class_0
 end
 formats["mp4-nvenc"] = MP4NVENC()
+local MP3
+do
+  local _class_0
+  local _parent_0 = Format
+  local _base_0 = { }
+  _base_0.__index = _base_0
+  setmetatable(_base_0, _parent_0.__base)
+  _class_0 = setmetatable({
+    __init = function(self)
+      self.displayName = "MP3 (libmp3lame)"
+      self.supportsTwopass = false
+      self.videoCodec = ""
+      self.audioCodec = "libmp3lame"
+      self.outputExtension = "mp3"
+      self.acceptsBitrate = true
+    end,
+    __base = _base_0,
+    __name = "MP3",
+    __parent = _parent_0
+  }, {
+    __index = function(cls, name)
+      local val = rawget(_base_0, name)
+      if val == nil then
+        local parent = rawget(cls, "__parent")
+        if parent then
+          return parent[name]
+        end
+      else
+        return val
+      end
+    end,
+    __call = function(cls, ...)
+      local _self_0 = setmetatable({}, _base_0)
+      cls.__init(_self_0, ...)
+      return _self_0
+    end
+  })
+  _base_0.__class = _class_0
+  if _parent_0.__inherited then
+    _parent_0.__inherited(_parent_0, _class_0)
+  end
+  MP3 = _class_0
+end
+formats["mp3"] = MP3()
+local GIF
+do
+  local _class_0
+  local _parent_0 = Format
+  local _base_0 = {
+    postCommandModifier = function(self, command, region, startTime, endTime)
+      local new_command = { }
+      local start_ts = seconds_to_time_string(startTime, false, true)
+      local end_ts = seconds_to_time_string(endTime, false, true)
+      start_ts = start_ts:gsub(":", "\\\\:")
+      end_ts = end_ts:gsub(":", "\\\\:")
+      local cfilter = "[vid1]trim=start=" .. tostring(start_ts) .. ":end=" .. tostring(end_ts) .. "[vidtmp];"
+      if mp.get_property("deinterlace") == "yes" then
+        cfilter = cfilter .. "[vidtmp]yadif=mode=1[vidtmp];"
+      end
+      for _, v in ipairs(command) do
+        local _continue_0 = false
+        repeat
+          if v:match("^%-%-vf%-add=lavfi%-scale") or v:match("^%-%-vf%-add=lavfi%-crop") or v:match("^%-%-vf%-add=fps") or v:match("^%-%-vf%-add=lavfi%-eq") then
+            local n = v:gsub("^%-%-vf%-add=", ""):gsub("^lavfi%-", "")
+            cfilter = cfilter .. "[vidtmp]" .. tostring(n) .. "[vidtmp];"
+          else
+            if v:match("^%-%-video%-rotate=90") then
+              cfilter = cfilter .. "[vidtmp]transpose=1[vidtmp];"
+            else
+              if v:match("^%-%-video%-rotate=270") then
+                cfilter = cfilter .. "[vidtmp]transpose=2[vidtmp];"
+              else
+                if v:match("^%-%-video%-rotate=180") then
+                  cfilter = cfilter .. "[vidtmp]transpose=1[vidtmp];[vidtmp]transpose=1[vidtmp];"
+                else
+                  if v:match("^%-%-deinterlace=") then
+                    _continue_0 = true
+                    break
+                  else
+                    append(new_command, {
+                      v
+                    })
+                    _continue_0 = true
+                    break
+                  end
+                end
+              end
+            end
+          end
+          _continue_0 = true
+        until true
+        if not _continue_0 then
+          break
+        end
+      end
+      cfilter = cfilter .. "[vidtmp]split[topal][vidf];"
+      cfilter = cfilter .. "[topal]palettegen[pal];"
+      cfilter = cfilter .. "[vidf]fifo[vidf];"
+      if options.gif_dither == 6 then
+        cfilter = cfilter .. "[vidf][pal]paletteuse[vo]"
+      else
+        cfilter = cfilter .. "[vidf][pal]paletteuse=dither=bayer:bayer_scale=" .. tostring(options.gif_dither) .. ":diff_mode=rectangle[vo]"
+      end
+      append(new_command, {
+        "--lavfi-complex=" .. tostring(cfilter)
+      })
+      return new_command
+    end
+  }
+  _base_0.__index = _base_0
+  setmetatable(_base_0, _parent_0.__base)
+  _class_0 = setmetatable({
+    __init = function(self)
+      self.displayName = "GIF"
+      self.supportsTwopass = false
+      self.videoCodec = "gif"
+      self.audioCodec = ""
+      self.outputExtension = "gif"
+      self.acceptsBitrate = false
+    end,
+    __base = _base_0,
+    __name = "GIF",
+    __parent = _parent_0
+  }, {
+    __index = function(cls, name)
+      local val = rawget(_base_0, name)
+      if val == nil then
+        local parent = rawget(cls, "__parent")
+        if parent then
+          return parent[name]
+        end
+      else
+        return val
+      end
+    end,
+    __call = function(cls, ...)
+      local _self_0 = setmetatable({}, _base_0)
+      cls.__init(_self_0, ...)
+      return _self_0
+    end
+  })
+  _base_0.__class = _class_0
+  if _parent_0.__inherited then
+    _parent_0.__inherited(_parent_0, _class_0)
+  end
+  GIF = _class_0
+end
+formats["gif"] = GIF()
 local Page
 do
   local _class_0
@@ -1130,7 +1420,7 @@ do
         copy_command_line = _accum_0
       end
       append(copy_command_line, {
-        '--term-status-msg=Encode time-pos: ${=time-pos}'
+        '--term-status-msg=Encode time-pos: ${=time-pos}\\n'
       })
       self:show()
       local processFd = run_subprocess_popen(copy_command_line)
@@ -1190,13 +1480,29 @@ get_active_tracks = function()
     audio = not mp.get_property_bool("mute"),
     sub = mp.get_property_bool("sub-visibility")
   }
-  local active = { }
+  local active = {
+    video = { },
+    audio = { },
+    sub = { }
+  }
   for _, track in ipairs(mp.get_property_native("track-list")) do
     if track["selected"] and accepted[track["type"]] then
-      active[#active + 1] = track
+      local count = #active[track["type"]]
+      active[track["type"]][count + 1] = track
     end
   end
   return active
+end
+local filter_tracks_supported_by_format
+filter_tracks_supported_by_format = function(active_tracks, format)
+  local has_video_codec = format.videoCodec ~= ""
+  local has_audio_codec = format.audioCodec ~= ""
+  local supported = {
+    video = has_video_codec and active_tracks["video"] or { },
+    audio = has_audio_codec and active_tracks["audio"] or { },
+    sub = has_video_codec and active_tracks["sub"] or { }
+  }
+  return supported
 end
 local append_track
 append_track = function(out, track)
@@ -1219,14 +1525,73 @@ append_track = function(out, track)
     })
   end
 end
+local append_audio_tracks
+append_audio_tracks = function(out, tracks)
+  local internal_tracks = { }
+  for _index_0 = 1, #tracks do
+    local track = tracks[_index_0]
+    if track['external'] then
+      append_track(out, track)
+    else
+      append(internal_tracks, {
+        track
+      })
+    end
+  end
+  if #internal_tracks > 1 then
+    local filter_string = ""
+    for _index_0 = 1, #internal_tracks do
+      local track = internal_tracks[_index_0]
+      filter_string = filter_string .. "[aid" .. tostring(track['id']) .. "]"
+    end
+    filter_string = filter_string .. "amix[ao]"
+    return append(out, {
+      "--lavfi-complex=" .. tostring(filter_string)
+    })
+  else
+    if #internal_tracks == 1 then
+      return append_track(out, internal_tracks[1])
+    end
+  end
+end
 local get_scale_filters
 get_scale_filters = function()
+  local filters = { }
+  if options.force_square_pixels then
+    append(filters, {
+      "lavfi-scale=iw*sar:ih"
+    })
+  end
   if options.scale_height > 0 then
-    return {
+    append(filters, {
       "lavfi-scale=-2:" .. tostring(options.scale_height)
+    })
+  end
+  return filters
+end
+local get_fps_filters
+get_fps_filters = function()
+  if options.fps > 0 then
+    return {
+      "fps=" .. tostring(options.fps)
     }
   end
   return { }
+end
+local get_contrast_brightness_and_saturation_filters
+get_contrast_brightness_and_saturation_filters = function()
+  local mpv_brightness = mp.get_property("brightness")
+  local mpv_contrast = mp.get_property("contrast")
+  local mpv_saturation = mp.get_property("saturation")
+  if mpv_brightness == 0 and mpv_contrast == 0 and mpv_saturation == 0 then
+    return { }
+  end
+  local eq_saturation = (mpv_saturation + 100) / 100.0
+  local eq_contrast = (mpv_contrast + 100) / 100.0
+  local eq_brightness = (mpv_brightness / 50.0 + eq_contrast - 1) / 2.0
+  return {
+    "lavfi-eq=contrast=" .. tostring(eq_contrast) .. ":saturation=" .. tostring(eq_saturation) .. ":brightness=" .. tostring(eq_brightness)
+  }
 end
 local append_property
 append_property = function(out, property_name, option_name)
@@ -1256,10 +1621,13 @@ get_playback_options = function()
   local ret = { }
   append_property(ret, "sub-ass-override")
   append_property(ret, "sub-ass-force-style")
+  append_property(ret, "sub-ass-vsfilter-aspect-compat")
   append_property(ret, "sub-auto")
+  append_property(ret, "sub-pos")
   append_property(ret, "sub-delay")
   append_property(ret, "video-rotate")
   append_property(ret, "ytdl-format")
+  append_property(ret, "deinterlace")
   return ret
 end
 local get_speed_flags
@@ -1310,37 +1678,114 @@ apply_current_filters = function(filters)
     end
   end
 end
+local get_video_filters
+get_video_filters = function(format, region)
+  local filters = { }
+  append(filters, format:getPreFilters())
+  if options.apply_current_filters then
+    apply_current_filters(filters)
+  end
+  if region and region:is_valid() then
+    append(filters, {
+      "lavfi-crop=" .. tostring(region.w) .. ":" .. tostring(region.h) .. ":" .. tostring(region.x) .. ":" .. tostring(region.y)
+    })
+  end
+  append(filters, get_scale_filters())
+  append(filters, get_fps_filters())
+  append(filters, get_contrast_brightness_and_saturation_filters())
+  append(filters, format:getPostFilters())
+  return filters
+end
+local get_video_encode_flags
+get_video_encode_flags = function(format, region)
+  local flags = { }
+  append(flags, get_playback_options())
+  local filters = get_video_filters(format, region)
+  for _index_0 = 1, #filters do
+    local f = filters[_index_0]
+    append(flags, {
+      "--vf-add=" .. tostring(f)
+    })
+  end
+  append(flags, get_speed_flags())
+  return flags
+end
+local calculate_bitrate
+calculate_bitrate = function(active_tracks, format, length)
+  if format.videoCodec == "" then
+    return nil, options.target_filesize * 8 / length
+  end
+  local video_kilobits = options.target_filesize * 8
+  local audio_kilobits = nil
+  local has_audio_track = #active_tracks["audio"] > 0
+  if options.strict_filesize_constraint and has_audio_track then
+    audio_kilobits = length * options.strict_audio_bitrate
+    video_kilobits = video_kilobits - audio_kilobits
+  end
+  local video_bitrate = math.floor(video_kilobits / length)
+  local audio_bitrate = audio_kilobits and math.floor(audio_kilobits / length) or nil
+  return video_bitrate, audio_bitrate
+end
+local find_path
+find_path = function(startTime, endTime)
+  local path = mp.get_property('path')
+  if not path then
+    return nil, nil, nil, nil, nil
+  end
+  local is_stream = not file_exists(path)
+  local is_temporary = false
+  if is_stream then
+    if mp.get_property('file-format') == 'hls' then
+      path = utils.join_path(parse_directory('~'), 'cache_dump.ts')
+      mp.command_native({
+        'dump_cache',
+        seconds_to_time_string(startTime, false, true),
+        seconds_to_time_string(endTime + 5, false, true),
+        path
+      })
+      endTime = endTime - startTime
+      startTime = 0
+      is_temporary = true
+    end
+  end
+  return path, is_stream, is_temporary, startTime, endTime
+end
 local encode
 encode = function(region, startTime, endTime)
   local format = formats[options.output_format]
-  local path = mp.get_property("path")
+  local originalStartTime = startTime
+  local originalEndTime = endTime
+  local path, is_stream, is_temporary
+  path, is_stream, is_temporary, startTime, endTime = find_path(startTime, endTime)
   if not path then
     message("No file is being played")
     return 
   end
-  local is_stream = not file_exists(path)
   local command = {
     "mpv",
     path,
     "--start=" .. seconds_to_time_string(startTime, false, true),
     "--end=" .. seconds_to_time_string(endTime, false, true),
-    "--ovc=" .. tostring(format.videoCodec),
-    "--oac=" .. tostring(format.audioCodec),
-    "--loop-file=no"
+    "--loop-file=no",
+    "--no-pause"
   }
-  local track_types_added = {
-    ["video"] = false,
-    ["audio"] = false,
-    ["sub"] = false
-  }
-  for _, track in ipairs(get_active_tracks()) do
-    append_track(command, track)
-    track_types_added[track['type']] = true
+  append(command, format:getCodecFlags())
+  local active_tracks = get_active_tracks()
+  local supported_active_tracks = filter_tracks_supported_by_format(active_tracks, format)
+  for track_type, tracks in pairs(supported_active_tracks) do
+    if track_type == "audio" then
+      append_audio_tracks(command, tracks)
+    else
+      for _index_0 = 1, #tracks do
+        local track = tracks[_index_0]
+        append_track(command, track)
+      end
+    end
   end
-  for track_type, was_added in pairs(track_types_added) do
+  for track_type, tracks in pairs(supported_active_tracks) do
     local _continue_0 = false
     repeat
-      if was_added then
+      if #tracks > 0 then
         _continue_0 = true
         break
       end
@@ -1364,57 +1809,40 @@ encode = function(region, startTime, endTime)
       break
     end
   end
-  append(command, get_playback_options())
-  local filters = { }
-  append(filters, format:getPreFilters())
-  if options.apply_current_filters then
-    apply_current_filters(filters)
+  if format.videoCodec ~= "" then
+    append(command, get_video_encode_flags(format, region))
   end
-  if region and region:is_valid() then
-    append(filters, {
-      "lavfi-crop=" .. tostring(region.w) .. ":" .. tostring(region.h) .. ":" .. tostring(region.x) .. ":" .. tostring(region.y)
-    })
-  end
-  append(filters, get_scale_filters())
-  append(filters, format:getPostFilters())
-  for _index_0 = 1, #filters do
-    local f = filters[_index_0]
-    append(command, {
-      "--vf-add=" .. tostring(f)
-    })
-  end
-  append(command, get_speed_flags())
   append(command, format:getFlags())
   if options.write_filename_on_metadata then
     append(command, get_metadata_flags())
   end
-  if options.target_filesize > 0 and format.acceptsBitrate then
-    local dT = endTime - startTime
-    if options.strict_filesize_constraint then
-      local video_kilobits = options.target_filesize * 8
-      if track_types_added["audio"] then
-        video_kilobits = video_kilobits - dT * options.strict_audio_bitrate
+  if format.acceptsBitrate then
+    if options.target_filesize > 0 then
+      local length = endTime - startTime
+      local video_bitrate, audio_bitrate = calculate_bitrate(supported_active_tracks, format, length)
+      if video_bitrate then
         append(command, {
-          "--oacopts-add=b=" .. tostring(options.strict_audio_bitrate) .. "k"
+          "--ovcopts-add=b=" .. tostring(video_bitrate) .. "k"
         })
       end
-      video_kilobits = video_kilobits * options.strict_bitrate_multiplier
-      local bitrate = math.floor(video_kilobits / dT)
-      append(command, {
-        "--ovcopts-add=b=" .. tostring(bitrate) .. "k",
-        "--ovcopts-add=minrate=" .. tostring(bitrate) .. "k",
-        "--ovcopts-add=maxrate=" .. tostring(bitrate) .. "k"
-      })
+      if audio_bitrate then
+        append(command, {
+          "--oacopts-add=b=" .. tostring(audio_bitrate) .. "k"
+        })
+      end
+      if options.strict_filesize_constraint then
+        local type = format.videoCodec ~= "" and "ovc" or "oac"
+        append(command, {
+          "--" .. tostring(type) .. "opts-add=minrate=" .. tostring(bitrate) .. "k",
+          "--" .. tostring(type) .. "opts-add=maxrate=" .. tostring(bitrate) .. "k"
+        })
+      end
     else
-      local bitrate = math.floor(options.target_filesize * 8 / dT)
+      local type = format.videoCodec ~= "" and "ovc" or "oac"
       append(command, {
-        "--ovcopts-add=b=" .. tostring(bitrate) .. "k"
+        "--" .. tostring(type) .. "opts-add=b=0"
       })
     end
-  elseif options.target_filesize <= 0 and format.acceptsBitrate then
-    append(command, {
-      "--ovcopts-add=b=0"
-    })
   end
   for token in string.gmatch(options.additional_flags, "[^%s]+") do
     command[#command + 1] = token
@@ -1439,11 +1867,12 @@ encode = function(region, startTime, endTime)
   if options.output_directory ~= "" then
     dir = parse_directory(options.output_directory)
   end
-  local formatted_filename = format_filename(startTime, endTime, format)
+  local formatted_filename = format_filename(originalStartTime, originalEndTime, format)
   local out_path = utils.join_path(dir, formatted_filename)
   append(command, {
-    "-o=" .. tostring(out_path)
+    "--o=" .. tostring(out_path)
   })
+  emit_event("encode-started")
   if options.twopass and format.supportsTwopass and not is_stream then
     local first_pass_cmdline
     do
@@ -1467,6 +1896,7 @@ encode = function(region, startTime, endTime)
     })
     if not res then
       message("First pass failed! Check the logs for details.")
+      emit_event("encode-finished", "fail")
       return 
     end
     append(command, {
@@ -1477,6 +1907,7 @@ encode = function(region, startTime, endTime)
       vp8_patch_logfile(get_pass_logfile_path(out_path), endTime - startTime)
     end
   end
+  command = format:postCommandModifier(command, region, startTime, endTime)
   msg.info("Encoding to", out_path)
   msg.verbose("Command line:", table.concat(command, " "))
   if options.run_detached then
@@ -1498,10 +1929,15 @@ encode = function(region, startTime, endTime)
     end
     if res then
       message("Encoded successfully! Saved to\\N" .. tostring(bold(out_path)))
+      emit_event("encode-finished", "success")
     else
       message("Encode failed! Check the logs for details.")
+      emit_event("encode-finished", "fail")
     end
-    return os.remove(get_pass_logfile_path(out_path))
+    os.remove(get_pass_logfile_path(out_path))
+    if is_temporary then
+      return os.remove(path)
+    end
   end
 end
 local CropPage
@@ -1797,15 +2233,23 @@ do
         ass:append(" ▶")
       end
       return ass:append("\\N")
+    end,
+    optVisible = function(self)
+      if self.visibleCheckFn == nil then
+        return true
+      else
+        return self.visibleCheckFn()
+      end
     end
   }
   _base_0.__index = _base_0
   _class_0 = setmetatable({
-    __init = function(self, optType, displayText, value, opts)
+    __init = function(self, optType, displayText, value, opts, visibleCheckFn)
       self.optType = optType
       self.displayText = displayText
       self.opts = opts
       self.value = 1
+      self.visibleCheckFn = visibleCheckFn
       return self:setValue(value)
     end,
     __base = _base_0,
@@ -1838,11 +2282,21 @@ do
       return self:draw()
     end,
     prevOpt = function(self)
-      self.currentOption = math.max(1, self.currentOption - 1)
+      for i = self.currentOption - 1, 1, -1 do
+        if self.options[i][2]:optVisible() then
+          self.currentOption = i
+          break
+        end
+      end
       return self:draw()
     end,
     nextOpt = function(self)
-      self.currentOption = math.min(#self.options, self.currentOption + 1)
+      for i = self.currentOption + 1, #self.options do
+        if self.options[i][2]:optVisible() then
+          self.currentOption = i
+          break
+        end
+      end
       return self:draw()
     end,
     confirmOpts = function(self)
@@ -1866,7 +2320,9 @@ do
       ass:append(tostring(bold('Options:')) .. "\\N\\N")
       for i, optPair in ipairs(self.options) do
         local opt = optPair[2]
-        opt:draw(ass, self.currentOption == i)
+        if opt:optVisible() then
+          opt:draw(ass, self.currentOption == i)
+        end
       end
       ass:append("\\N▲ / ▼: navigate\\N")
       ass:append(tostring(bold('ENTER:')) .. " confirm options\\N")
@@ -1887,6 +2343,9 @@ do
             "no"
           },
           {
+            144
+          },
+          {
             240
           },
           {
@@ -1894,6 +2353,9 @@ do
           },
           {
             480
+          },
+          {
+            540
           },
           {
             720
@@ -1923,12 +2385,46 @@ do
           [-1] = "disabled"
         }
       }
+      local fpsOpts = {
+        possibleValues = {
+          {
+            -1,
+            "source"
+          },
+          {
+            15
+          },
+          {
+            24
+          },
+          {
+            30
+          },
+          {
+            48
+          },
+          {
+            50
+          },
+          {
+            60
+          },
+          {
+            120
+          },
+          {
+            240
+          }
+        }
+      }
       local formatIds = {
         "webm-vp8",
         "webm-vp9",
         "mp4",
         "mp4-nvenc",
-        "raw"
+        "raw",
+        "mp3",
+        "gif"
       }
       local formatOpts = {
         possibleValues = (function()
@@ -1944,6 +2440,38 @@ do
           end
           return _accum_0
         end)()
+      }
+      local gifDitherOpts = {
+        possibleValues = {
+          {
+            0,
+            "bayer_scale 0"
+          },
+          {
+            1,
+            "bayer_scale 1"
+          },
+          {
+            2,
+            "bayer_scale 2"
+          },
+          {
+            3,
+            "bayer_scale 3"
+          },
+          {
+            4,
+            "bayer_scale 4"
+          },
+          {
+            5,
+            "bayer_scale 5"
+          },
+          {
+            6,
+            "sierra2_4a"
+          }
+        }
       }
       self.options = {
         {
@@ -1977,6 +2505,20 @@ do
         {
           "crf",
           Option("int", "CRF", options.crf, crfOpts)
+        },
+        {
+          "fps",
+          Option("list", "FPS", options.fps, fpsOpts)
+        },
+        {
+          "gif_dither",
+          Option("list", "GIF Dither Type", options.gif_dither, gifDitherOpts, function()
+            return self.options[1][2]:getValue() == "gif"
+          end)
+        },
+        {
+          "force_square_pixels",
+          Option("bool", "Force Square Pixels", options.force_square_pixels)
         }
       }
       self.keybinds = {
@@ -2198,6 +2740,10 @@ do
       ass:append(tostring(bold('ESC:')) .. " close\\N")
       return mp.set_osd_ass(window_w, window_h, ass.text)
     end,
+    show = function(self)
+      _class_0.__parent.show(self)
+      return emit_event("show-main-page")
+    end,
     onUpdateCropRegion = function(self, updated, newRegion)
       if updated then
         self.region = newRegion
@@ -2357,10 +2903,12 @@ mp.add_key_binding(options.keybind, "display-webm-encoder", (function()
 end)(), {
   repeatable = false
 })
-return mp.register_event("file-loaded", (function()
+mp.register_event("file-loaded", (function()
   local _base_0 = mainPage
   local _fn_0 = _base_0.setupStartAndEndTimes
   return function(...)
     return _fn_0(_base_0, ...)
   end
 end)())
+msg.verbose("Loaded mpv-webm script!")
+return emit_event("script-loaded")
